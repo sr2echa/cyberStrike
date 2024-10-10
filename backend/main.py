@@ -4,7 +4,6 @@ import re
 import json
 import base64
 import datetime
-import openai
 import logging
 from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -12,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from llama_index.llms.openai import OpenAI
+from llama_index.llms.gemini import Gemini
 from llama_index.core import Document, Settings, VectorStoreIndex, SummaryIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -30,6 +30,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+document_store = {}
+UPLOADS_DIR = "uploads"
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,27 +42,40 @@ app.add_middleware(
     allow_credentials=True
 )
 
-# Initialize LLM
+# Initialize OpenAI LLM
 openai_llm = None
 try:
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if openai_api_key:
         openai_llm = OpenAI(api_key=openai_api_key)
         Settings.llm = openai_llm
-        logger.info("Using OpenAI LLM")
+        logger.info("Using OpenAI LLM for multi-document processing and chat")
     else:
         logger.warning("Couldn't find OpenAI API key.")
 except Exception as e:
-    logger.error(f"Error initializing LLM: {e}")
+    logger.error(f"Error initializing OpenAI LLM: {e}")
 
 if not openai_llm:
     raise ValueError("Failed to initialize OpenAI LLM. Please check your OpenAI API key.")
 
 Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 
-document_store = {}
-UPLOADS_DIR = "uploads"
-os.makedirs(UPLOADS_DIR, exist_ok=True)
+# Initialize Gemini LLM
+gemini_llm = None
+try:
+    google_api_key = os.environ.get("GOOGLE_API_KEY")
+    if google_api_key:
+        gemini_llm = Gemini(api_key=google_api_key)
+        logger.info("Using Gemini LLM for other endpoints")
+    else:
+        logger.warning("Couldn't find Google API key.")
+except Exception as e:
+    logger.error(f"Error initializing Gemini LLM: {e}")
+
+if not gemini_llm:
+    logger.warning("Failed to initialize Gemini LLM. Some endpoints may not work correctly.")
+
+
 
 class FileUpload(BaseModel):
     file: str
@@ -112,24 +128,19 @@ def clean_llm_response(response: str) -> str:
     return cleaned
 
 def get_document_info(file_id: str) -> Dict[str, Any]:
-    if file_id in document_store:
-        return document_store[file_id]
-    
     info_path = os.path.join(UPLOADS_DIR, f"{file_id}_info.json")
-    if os.path.exists(info_path):
-        with open(info_path, 'r') as f:
-            doc_info = json.load(f)
-   
-        if 'full_text' in doc_info:
-            document = Document(text=doc_info['full_text'])
-            splitter = SentenceSplitter(chunk_size=1024)
-            nodes = splitter.get_nodes_from_documents([document])
-            doc_info['index'] = VectorStoreIndex(nodes)
-        
-        document_store[file_id] = doc_info
-        return doc_info
+    full_text_path = os.path.join(UPLOADS_DIR, f"{file_id}_full_text.txt")
     
-    raise HTTPException(status_code=404, detail="Document not found")
+    if not os.path.exists(info_path) or not os.path.exists(full_text_path):
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    with open(info_path, 'r') as f:
+        doc_info = json.load(f)
+    
+    with open(full_text_path, 'r', encoding='utf-8') as f:
+        doc_info['full_text'] = f.read()
+    
+    return doc_info
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_documents(upload_request: UploadRequest, background_tasks: BackgroundTasks):
@@ -150,7 +161,7 @@ async def upload_documents(upload_request: UploadRequest, background_tasks: Back
     except Exception as e:
         logger.error(f"Error processing upload: {e}")
         raise HTTPException(status_code=500, detail="Error processing upload")
-    
+
 class DocumentProcessor:
     def __init__(self, file_path: str):
         self.file_path = file_path
@@ -168,7 +179,6 @@ class DocumentProcessor:
         self.summary_index = SummaryIndex(self.nodes)
         self.vector_index = VectorStoreIndex(self.nodes)
         
-        # Create KnowledgeGraphIndex
         storage_context = StorageContext.from_defaults()
         self.kg_index = KnowledgeGraphIndex(
             nodes=self.nodes,
@@ -178,52 +188,6 @@ class DocumentProcessor:
             show_progress=True,
         )
         self.kg_index._build_index_from_nodes(self.nodes)
-        
-class QueryEngineBuilder:
-    def __init__(self, summary_index: SummaryIndex, vector_index: VectorStoreIndex, kg_index: KnowledgeGraphIndex):
-        self.summary_index = summary_index
-        self.vector_index = vector_index
-        self.kg_index = kg_index
-        self.query_engine = None
-
-    def build_query_engine(self):
-        summary_query_engine = self.summary_index.as_query_engine(
-            response_mode="tree_summarize",
-            use_async=True,
-        )
-        vector_query_engine = self.vector_index.as_query_engine()
-        kg_query_engine = self.kg_index.as_query_engine(
-            include_text=True,
-            retriever_mode="keyword",
-            response_mode="tree_summarize",
-            embedding_mode="hybrid",
-            similarity_top_k=3,
-            explore_global_knowledge=True,
-        )
-
-        summary_tool = QueryEngineTool.from_defaults(
-            query_engine=summary_query_engine,
-            description="Useful for summarization questions related to the Document"
-        )
-
-        vector_tool = QueryEngineTool.from_defaults(
-            query_engine=vector_query_engine,
-            description="Useful for retrieving specific context from the Document."
-        )
-
-        kg_tool = QueryEngineTool.from_defaults(
-            query_engine=kg_query_engine,
-            description="Useful for understanding relationships and connections within the Document."
-        )
-
-        self.query_engine = RouterQueryEngine(
-            selector=LLMSingleSelector.from_defaults(),
-            query_engine_tools=[summary_tool, vector_tool, kg_tool],
-            verbose=True
-        )
-
-
-document_store = {}
 
 async def process_document(file_path: str, file_hash: str, original_filename: str):
     try:
@@ -234,22 +198,14 @@ async def process_document(file_path: str, file_hash: str, original_filename: st
         
         doc = fitz.open(file_path)
         page_count = len(doc)
-        
-        # Extract author information
         metadata = doc.metadata
         author = metadata.get('author', 'Unknown')
         
+        full_text = pymupdf4llm.to_markdown(file_path)
+        
         doc.close()
 
-        processor = DocumentProcessor(file_path)
-        processor.process()
-        
-        query_engine_builder = QueryEngineBuilder(processor.summary_index, processor.vector_index, processor.kg_index)
-        query_engine_builder.build_query_engine()
-        
         doc_info = {
-            "query_engine": query_engine_builder.query_engine,
-            "full_text": processor.full_text,
             "filename": original_filename,
             "size": file_size,
             "upload_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -259,14 +215,34 @@ async def process_document(file_path: str, file_hash: str, original_filename: st
             "author": author
         }
         
-        document_store[file_hash] = doc_info
-        info_to_save = {k: v for k, v in doc_info.items() if k not in ['query_engine', 'full_text']}
+        # Save doc_info
         info_path = os.path.join(UPLOADS_DIR, f"{file_hash}_info.json")
         with open(info_path, "w") as f:
-            json.dump(info_to_save, f, default=str)
+            json.dump(doc_info, f, default=str)
+        
+        # Save full_text separately
+        full_text_path = os.path.join(UPLOADS_DIR, f"{file_hash}_full_text.txt")
+        with open(full_text_path, "w", encoding='utf-8') as f:
+            f.write(full_text)
+        
+        # Process the document for indexing
+        processor = DocumentProcessor(file_path)
+        processor.process()
+        
+        # Save processed data
+        index_path = os.path.join(UPLOADS_DIR, f"{file_hash}_index.json")
+        with open(index_path, "w") as f:
+            json.dump({
+                "summary_index": processor.summary_index.to_dict(),
+                "vector_index": processor.vector_index.to_dict(),
+                "kg_index": processor.kg_index.to_dict()
+            }, f)
+
+        logger.info(f"Successfully processed document: {original_filename}")
 
     except Exception as e:
-        logger.error(f"Error processing document: {e}")
+        logger.error(f"Error processing document {original_filename}: {str(e)}")
+
 
 def get_available_documents():
     documents = {}
@@ -278,38 +254,14 @@ def get_available_documents():
             documents[file_id] = doc_info
     return documents
 
-def summarize_for_tool(summary_content):
-    """
-    Generates a compact summary of the provided content using OpenAI's API.
-
-    Parameters:
-        api_key (str): Your OpenAI API key.
-        summary_content (str): The content to summarize.
-
-    Returns:
-        str: A concise summary of the content, limited to 100 words.
-    """
-    # Construct the prompt for summarization
+def summarize_for_tool(summary_content: str) -> str:
     prompt = f"Please summarize the following content in no more than 100 words for easy tool selection:\n\n{summary_content}"
-
     try:
-        # Call the OpenAI API for summarization
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for summarizing content."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,  # Allow some buffer for the response
-            temperature=0.1
-        )
-
-        # Extract the summary from the response
-        summary = response['choices'][0]['message']['content'].strip()
-        return summary
-
+        response = openai_llm.complete(prompt)
+        return response.text.strip()
     except Exception as e:
         return f"An error occurred: {str(e)}"
+
 @app.post("/chat")
 async def chat(chat_request: ChatRequest):
     try:
@@ -330,69 +282,79 @@ async def chat(chat_request: ChatRequest):
         
         for doc_name in titles:
             file_id = next(id for id, info in available_documents.items() if info["filename"] == doc_name)
-            doc_info = get_document_info(file_id)
-            
-            if 'full_text' not in doc_info:
-                logger.warning(f"Full text not found for document {doc_name}. Skipping...")
+            try:
+                doc_info = get_document_info(file_id)
+                
+                if 'full_text' not in doc_info:
+                    logger.warning(f"Full text not found for document {doc_name}. Skipping...")
+                    continue
+                
+                # Load pre-processed index data
+                index_path = os.path.join(UPLOADS_DIR, f"{file_id}_index.json")
+                if not os.path.exists(index_path):
+                    logger.warning(f"Index file not found for document {doc_name}. Skipping...")
+                    continue
+
+                with open(index_path, 'r') as f:
+                    index_data = json.load(f)
+                
+                doc_name = doc_name[:-4]  # Remove .pdf extension
+                docs_list[doc_name] = DocumentProcessor(doc_info['full_text'])
+                docs_list[doc_name].summary_index = SummaryIndex.from_dict(index_data['summary_index'])
+                docs_list[doc_name].vector_index = VectorStoreIndex.from_dict(index_data['vector_index'])
+                docs_list[doc_name].kg_index = KnowledgeGraphIndex.from_dict(index_data['kg_index'])
+                
+                vector_index[doc_name] = docs_list[doc_name].vector_index
+                summary_index[doc_name] = docs_list[doc_name].summary_index
+                
+                # Generate summary for tool selection
+                summary_to_identify[doc_name] = summarize_for_tool(doc_info['full_text'][:1000])  # Use first 1000 characters for summary
+                
+                vector_query_engine = vector_index[doc_name].as_query_engine(llm=openai_llm)
+                summary_query_engine = summary_index[doc_name].as_query_engine(llm=openai_llm)
+                query_engine_tools = [
+                    QueryEngineTool(
+                        query_engine=vector_query_engine,
+                        metadata=ToolMetadata(
+                            name="vector_tool",
+                            description=(
+                                "Useful for questions related to specific aspects of"
+                                f" {doc_name} (e.g the vulnerabilities, key findings)."
+                            ),
+                        ),
+                    ),
+                    QueryEngineTool(
+                        query_engine=summary_query_engine,
+                        metadata=ToolMetadata(
+                            name="summary_tool",
+                            description=(
+                                "Useful for any requests that require a holistic summary"
+                                f" of EVERYTHING about {doc_name}. For questions about"
+                                " more specific sections, please use the vector_tool."
+                            ),
+                        ),
+                    ),
+                ]
+                
+                function_llm = OpenAI(model="gpt-4-0125-preview")
+                agent = OpenAIAgent.from_tools(
+                    query_engine_tools,
+                    llm=function_llm,
+                    verbose=True,
+                    system_prompt=f"""\
+                You are a specialized agent designed to answer queries about {doc_name}.
+                Choose this document based on {summary_to_identify[doc_name]}
+                You must ALWAYS use at least one of the tools provided when answering a question; do NOT rely on prior knowledge.\
+                """,
+                )
+                agents[doc_name] = agent
+                query_engines[doc_name] = vector_index[doc_name].as_query_engine(
+                    similarity_top_k=3
+                )
+            except Exception as e:
+                logger.error(f"Error processing document {doc_name}: {str(e)}")
                 continue
-            
-            document = Document(text=doc_info['full_text'])
-            splitter = SentenceSplitter(chunk_size=1024)
-            nodes = splitter.get_nodes_from_documents([document])
-            
-            doc_name = doc_name[:-4]  # Remove .pdf extension
-            docs_list[doc_name] = DocumentProcessor(os.path.join(UPLOADS_DIR, f"{file_id}.pdf"))
-            docs_list[doc_name].full_text = doc_info['full_text']
-            docs_list[doc_name].nodes = nodes
-            all_nodes.extend(nodes)
-            
-            vector_index[doc_name] = VectorStoreIndex(nodes)
-            summary_index[doc_name] = SummaryIndex(nodes)
-            node_ids = [node_id for value in summary_index[doc_name].ref_doc_info.values() for node_id in value.node_ids[:4]]
-            summary_to_identify[doc_name] = summarize_for_tool(summary_index[doc_name].docstore.get_nodes(node_ids))
-            
-            vector_query_engine = vector_index[doc_name].as_query_engine(llm=Settings.llm)
-            summary_query_engine = summary_index[doc_name].as_query_engine(llm=Settings.llm)
-            query_engine_tools = [
-                QueryEngineTool(
-                    query_engine=vector_query_engine,
-                    metadata=ToolMetadata(
-                        name="vector_tool",
-                        description=(
-                            "Useful for questions related to specific aspects of"
-                            f" {doc_name} (e.g the vulnerabilities, key findings)."
-                        ),
-                    ),
-                ),
-                QueryEngineTool(
-                    query_engine=summary_query_engine,
-                    metadata=ToolMetadata(
-                        name="summary_tool",
-                        description=(
-                            "Useful for any requests that require a holistic summary"
-                            f" of EVERYTHING about {doc_name}. For questions about"
-                            " more specific sections, please use the vector_tool."
-                        ),
-                    ),
-                ),
-            ]   
-            function_llm = OpenAI(model="gpt-4o-mini")
-            agent = OpenAIAgent.from_tools(
-                query_engine_tools,
-                llm=function_llm,
-                verbose=True,
-                system_prompt=f"""\
-        You are a specialized agent designed to answer queries about {doc_name}.
-        Choose this document based on {summary_to_identify[doc_name]}
-        You must ALWAYS use at least one of the tools provided when answering a question; do NOT rely on prior knowledge.\
-        """,
-            )
-            agents[doc_name] = agent
-            query_engines[doc_name] = vector_index[doc_name].as_query_engine(
-                similarity_top_k=3
-            )
         
-        # Rest of the function remains the same
         all_tools = []
         for docs in titles:
             docs = docs[:-4]
@@ -453,10 +415,7 @@ async def get_file_info(file_id: str):
     if not doc_info:
         raise HTTPException(status_code=404, detail="File not found")
     
-    # Convert file size to MB
     file_size_mb = f"{doc_info['size'] / (1024 * 1024):.1f} MB"
-    
-    # Extract date from last_modified
     last_edited = doc_info["last_modified"].split()[0]
     
     return FileInfoResponse(
@@ -464,12 +423,9 @@ async def get_file_info(file_id: str):
         file_size=file_size_mb,
         last_edited=last_edited,
         page_count=doc_info["page_count"],
-        author="Security Team",  # You may need to add this field to your document processing
-        created_at=doc_info["created_at"].split()[0]  # Extract date only
+        author=doc_info["author"],
+        created_at=doc_info["created_at"].split()[0]
     )
-
-
-
 
 @app.post("/keyfindings", response_model=KeyFindingsResponse)
 async def get_key_findings(id_request: IdRequest):
@@ -528,7 +484,7 @@ async def get_key_findings(id_request: IdRequest):
         IMPORTANT: Ensure that your response contains only the JSON object and no additional text.
         """
         
-        response = openai_llm.complete(prompt + "\n\nDocument content:\n" + full_text)
+        response = gemini_llm.complete(prompt + "\n\nDocument content:\n" + full_text)
         
         if not response.text.strip():
             raise ValueError("Empty response from LLM")
@@ -587,7 +543,7 @@ async def get_vulnerabilities(id_request: IdRequest):
         Ensure that your response contains only the JSON array and no additional text.
         """
         
-        response = openai_llm.complete(prompt + "\n\nDocument content:\n" + full_text)
+        response = gemini_llm.complete(prompt + "\n\nDocument content:\n" + full_text)
         
         if not response.text.strip():
             raise ValueError("Empty response from LLM")
@@ -624,7 +580,6 @@ async def get_vulnerabilities(id_request: IdRequest):
         logger.error(f"Error extracting vulnerabilities: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error extracting vulnerabilities: {str(e)}")
 
-
 @app.post("/summarize", response_model=SummarizeResponse)
 async def summarize_document(summarize_request: SummarizeRequest):
     try:
@@ -645,7 +600,7 @@ async def summarize_document(summarize_request: SummarizeRequest):
         Summary:
         """
 
-        response = openai_llm.complete(summarization_prompt)
+        response = gemini_llm.complete(summarization_prompt)
         return SummarizeResponse(summary=response.text)
     except Exception as e:
         logger.error(f"Error summarizing document: {e}")
@@ -690,13 +645,19 @@ async def root():
 @app.get("/health")
 async def health_check():
     try:
-        response = openai_llm.complete("Say 'Gemini is working!'")
-        if "Gemini is working" in response.text:
-            return {"status": "healthy", "llm": "Gemini"}
-        else:
-            return {"status": "unhealthy", "llm": "Gemini", "reason": "Unexpected response"}
+        openai_response = openai_llm.complete("Say 'OpenAI is working!'")
+        gemini_response = gemini_llm.complete("Say 'Gemini is working!'")
+        
+        openai_status = "healthy" if "OpenAI is working" in openai_response.text else "unhealthy"
+        gemini_status = "healthy" if "Gemini is working" in gemini_response.text else "unhealthy"
+        
+        return {
+            "status": "healthy" if openai_status == "healthy" and gemini_status == "healthy" else "partial",
+            "openai": openai_status,
+            "gemini": gemini_status
+        }
     except Exception as e:
-        return {"status": "unhealthy", "llm": "Gemini", "reason": str(e)}
+        return {"status": "unhealthy", "reason": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
